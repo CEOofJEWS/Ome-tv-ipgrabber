@@ -1,0 +1,163 @@
+if (!window._rtcHooked) {
+    window._rtcHooked = true;
+
+    // --- API-SCHLÜSSEL ---
+    const IPGEO_API_KEY = 'e75e81a9325545de97027ba742466588'; 
+    const IPINFO_API_KEY = 'b9f05f6907d2da'; 
+
+    const processedCandidates = new Set();
+    const locationCache = {};
+
+    window.ORIGINAL_RTCPeerConnection = window.RTCPeerConnection;
+
+    const log = (msg, style) => console.log(`%c${msg}`, style);
+    
+    const analyzeCandidate = (candidate) => {
+        const parts = candidate.split(' ');
+        if (parts.length < 8) return null;
+        return {
+            type: parts[7],
+            address: parts[4],
+            port: parts[5],
+        };
+    };
+
+    const getDetailedLocation = async (ip) => {
+        if (locationCache[ip]) {
+            return locationCache[ip];
+        }
+
+        try {
+            const [ipgeoResponse, ipinfoResponse] = await Promise.all([
+                fetch(`https://api.ipgeolocation.io/ipgeo?apiKey=${IPGEO_API_KEY}&ip=${ip}`),
+                fetch(`https://ipinfo.io/${ip}/json?token=${IPINFO_API_KEY}`)
+            ]);
+
+            const ipgeoJson = await ipgeoResponse.json();
+            const ipinfoJson = await ipinfoResponse.json();
+
+            if (ipgeoResponse.ok && ipinfoResponse.ok) {
+                const formatted = {
+                    ip: ip,
+                    hostname: ipinfoJson.hostname || 'N/A',
+                    city: ipgeoJson.city || ipinfoJson.city || 'Unknown',
+                    region: ipinfoJson.region || ipgeoJson.state_prov || 'Unknown',
+                    country: ipgeoJson.country_name || ipinfoJson.country || 'Unknown',
+                    postal: ipgeoJson.zipcode || ipinfoJson.postal || 'N/A',
+                    lat: ipgeoJson.latitude,
+                    lng: ipgeoJson.longitude,
+                    isp: ipgeoJson.isp || ipinfoJson.org || 'Unknown',
+                    org: ipinfoJson.org || 'N/A',
+                    asn: ipgeoJson.asn || `AS${ipinfoJson.org.split(' ')[0]}` || 'Unknown',
+                    type: ipinfoJson.type || 'Unknown',
+                    vpn: ipinfoJson.privacy?.vpn || false,
+                    proxy: ipinfoJson.privacy?.proxy || false,
+                    tor: ipinfoJson.privacy?.tor || false,
+                    hosting: ipinfoJson.privacy?.hosting || false,
+                    timezone: ipgeoJson.time_zone?.name || 'N/A',
+                    currency: ipgeoJson.currency?.name || 'N/A',
+                };
+                locationCache[ip] = formatted;
+                return formatted;
+            } else {
+                return null;
+            }
+        } catch (e) { 
+            return null;
+        }
+    };
+
+    // --- NEUE FUNKTION: HINWEIS GENERIEREN ---
+    const getAnalysisHint = (data) => {
+        if (data.tor) {
+            return '⚠️ Hinweis: Nutzung des Tor-Netzwerks (hohe Anonymität)';
+        }
+        if (data.hosting && data.vpn) {
+            return '⚠️ Hinweis: Server/Rechenzentrum mit VPN';
+        }
+        if (data.type === 'mobile') {
+            return '✅ Hinweis: Mobile Internetverbindung';
+        }
+        if (data.vpn || data.proxy) {
+            return '⚠️ Hinweis: Nutzung eines VPN oder Proxy';
+        }
+        return '👍 Hinweis: Normale, direkte Internetverbindung';
+    };
+
+    window.RTCPeerConnection = function(...args) {
+        const pc = new window.ORIGINAL_RTCPeerConnection(...args);
+        const originalAddCandidate = pc.addIceCandidate.bind(pc);
+
+        pc.addIceCandidate = async (candidate) => {
+            if (candidate?.candidate) {
+                const cand = analyzeCandidate(candidate.candidate);
+                if (!cand) return originalAddCandidate(candidate);
+
+                if (!['srflx', 'prflx'].includes(cand.type)) {
+                    return originalAddCandidate(candidate);
+                }
+
+                const key = cand.address; 
+                if (processedCandidates.has(key)) {
+                    return originalAddCandidate(candidate);
+                }
+                
+                processedCandidates.add(key);
+
+                const detailedData = await getDetailedLocation(cand.address);
+                
+                if (detailedData) {
+                    console.clear(); 
+                    log(`🔍 Externer Nutzer gefunden (Vollständige Analyse)`, 'color: #00aa00; font-weight: bold; font-size: 14px;');
+
+                    // --- HINWEIS BLOCK ---
+                    const hint = getAnalysisHint(detailedData);
+                    const hintColor = hint.includes('⚠️') ? 'color: #ff9900;' : 'color: #00ff00;';
+                    console.log(`\n%c${hint}`, hintColor);
+
+                    const userData = {
+                        '--- IP & Host ---': '---',
+                        'IP-Adresse': detailedData.ip,
+                        'Hostname': detailedData.hostname,
+
+                        '--- Standort ---': '---',
+                        'Stadt': detailedData.city,
+                        'Region': detailedData.region,
+                        'Land': detailedData.country,
+                        'PLZ': detailedData.postal,
+                        'Koordinaten': `${detailedData.lat}, ${detailedData.lng}`,
+
+                        '--- Netzwerk ---': '---',
+                        'ISP': detailedData.isp,
+                        'Organisation': detailedData.org,
+                        'ASN': detailedData.asn,
+                        'Verbindungstyp': detailedData.type,
+
+                        '--- Sicherheit & Anonymität ---': '---',
+                        'VPN': detailedData.vpn ? 'Yes' : 'No',
+                        'Proxy': detailedData.proxy ? 'Yes' : 'No',
+                        'Tor': detailedData.tor ? 'Yes' : 'No',
+                        'Hosting-Service': detailedData.hosting ? 'Yes' : 'No',
+
+                        '--- Sonstiges ---': '---',
+                        'Zeitzone': detailedData.timezone,
+                        'Währung': detailedData.currency,
+                    };
+
+                    console.table(userData);
+
+                    // Der Google Maps Link bleibt als Bonus
+                    if (detailedData.lat && detailedData.lng) {
+                        const mapUrl = `https://www.google.com/maps?q=${detailedData.lat},${detailedData.lng}&z=15`;
+                        console.log(`%c🗺️ Karte öffnen`, `color: white; background-color: #4285F4; padding: 5px 10px; border-radius: 5px; font-weight: bold;`, mapUrl);
+                    }
+                }
+            }
+            return originalAddCandidate(candidate);
+        };
+
+        return pc;
+    };
+
+    log('🚀 Maximal-Logger (Alle Infos + Hinweis) Initialisiert', 'color: #00aa00; font-weight: bold;');
+}
